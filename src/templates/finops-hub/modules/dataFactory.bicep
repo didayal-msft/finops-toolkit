@@ -279,7 +279,9 @@ resource storageAccount 'Microsoft.Storage/storageAccounts@2022-09-01' existing 
   name: storageAccountName
 }
 
-// Create trigger
+//------------------------------------------------------------------------------
+// Triggers
+//------------------------------------------------------------------------------
 resource trigger_exportContainer 'Microsoft.DataFactory/factories/triggers@2018-06-01' = {
   name: safeExportContainerName
   parent: dataFactory
@@ -314,6 +316,275 @@ resource trigger_exportContainer 'Microsoft.DataFactory/factories/triggers@2018-
   }
 }
 
+resource trigger_configContainer 'Microsoft.DataFactory/factories/triggers@2018-06-01' = {
+  name: safeConfigContainerName
+  parent: dataFactory
+  dependsOn: [
+    stopHubTriggers
+  ]
+  properties: {
+    annotations: []
+    pipelines: [
+      {
+        pipelineReference: {
+          referenceName: pipeline_update.name
+          type: 'PipelineReference'
+        }
+        parameters: {
+          folderName: '@triggerBody().folderPath'
+          fileName: '@triggerBody().fileName'
+        }
+      }
+    ]
+    type: 'BlobEventsTrigger'
+    typeProperties: {
+      blobPathBeginsWith: '/${configContainerName}/blobs/'
+      blobPathEndsWith: 'settings.json'
+      ignoreEmptyBlobs: true
+      scope: storageAccount.id
+      events: [
+        'Microsoft.Storage.BlobCreated'
+      ]
+    }
+  }
+}
+
+//------------------------------------------------------------------------------
+// Pipelines
+//------------------------------------------------------------------------------
+
+//------------------------------------------------------------------------------
+// Config container update pipeline
+// Triggered when settings.json is updated.
+// Executes pipeline_setup for Azure export scopes.
+//------------------------------------------------------------------------------
+resource pipeline_update 'Microsoft.DataFactory/factories/pipelines@2018-06-01' = {
+  name: '${safeExportContainerName}_update'
+  parent: dataFactory
+  dependsOn: [
+    dataset_config
+    pipeline_setup
+  ]
+  properties: {
+    activities: [
+      {
+        name: 'Get Config'
+        type: 'Lookup'
+        dependsOn: []
+        policy: {
+          timeout: '0.12:00:00'
+          retry: 0
+          retryIntervalInSeconds: 30
+          secureOutput: false
+          secureInput: false
+        }
+        userProperties: []
+        typeProperties: {
+          source: {
+            type: 'JsonSource'
+            storeSettings: {
+              type: 'AzureBlobFSReadSettings'
+              recursive: true
+              enablePartitionDiscovery: false
+            }
+            formatSettings: {
+              type: 'JsonReadSettings'
+            }
+          }
+          dataset: {
+            referenceName: 'config'
+            type: 'DatasetReference'
+            parameters: {
+              fileName: {
+                value: '@pipeline().parameters.fileName'
+                type: 'Expression'
+              }
+              folderName: {
+                value: '@pipeline().parameters.folderName'
+                type: 'Expression'
+              }
+            }
+          }
+        }
+      }
+      {
+        name: 'ForEach Export Scope'
+        type: 'ForEach'
+        dependsOn: [
+          {
+            activity: 'Get Config'
+            dependencyConditions: [
+              'Succeeded'
+            ]
+          }
+        ]
+        userProperties: []
+        typeProperties: {
+          items: {
+            value: '@activity(\'Get Config\').output.firstRow.exportScopes'
+            type: 'Expression'
+          }
+          activities: [
+            {
+              name: 'If Supported Cloud Type'
+              type: 'IfCondition'
+              dependsOn: []
+              userProperties: []
+              typeProperties: {
+                expression: {
+                  value: '@or(equals(item().cloud, \'AzureCloud\'),equals(item().cloud, \'AzureUSGovernment\'))'
+                  type: 'Expression'
+                }
+                ifTrueActivities: [
+                  {
+                    name: 'Add or Update Export'
+                    type: 'ExecutePipeline'
+                    dependsOn: []
+                    userProperties: []
+                    typeProperties: {
+                      pipeline: {
+                        referenceName: 'msexports_setup'
+                        type: 'PipelineReference'
+                      }
+                      waitOnCompletion: true
+                      parameters: {
+                        Cloud: {
+                          value: '@item().Cloud'
+                          type: 'Expression'
+                        }
+                        ExportScope: {
+                          value: '@item().ExportScope'
+                          type: 'Expression'
+                        }
+                        TenantId: {
+                          value: '@item().TenantId'
+                          type: 'Expression'
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    ]
+    parameters: {
+      fileName: {
+        type: 'string'
+      }
+      folderName: {
+        type: 'string'
+      }
+    }
+    annotations: []
+  }
+}
+
+//------------------------------------------------------------------------------
+// Azure Cost Management add export pipeline
+// Creates an export in Azure Cost Management.
+//------------------------------------------------------------------------------
+resource pipeline_setup 'Microsoft.DataFactory/factories/pipelines@2018-06-01' = {
+  name: '${safeExportContainerName}_setup'
+  parent: dataFactory
+  dependsOn: [
+    dataset_config
+  ]
+  properties: {
+    activities: [
+      {
+        name: 'If Azure Commercial'
+        type: 'IfCondition'
+        dependsOn: []
+        userProperties: []
+        typeProperties: {
+          expression: {
+            value: '@equals(toLower(pipeline().parameters.Cloud), \'azurecloud\')'
+            type: 'Expression'
+          }
+          ifTrueActivities: [
+            {
+              name: 'Set Resource Management URI Suffix'
+              type: 'SetVariable'
+              dependsOn: []
+              userProperties: []
+              typeProperties: {
+                variableName: 'resourceManagementUri'
+                value: 'management.azure.com'
+              }
+            }
+            {
+              name: 'Set KeyVault URI'
+              type: 'SetVariable'
+              dependsOn: []
+              userProperties: []
+              typeProperties: {
+                variableName: 'keyVaultUriSuffix'
+                value: 'vault.azure.net'
+              }
+            }
+            {
+              name: 'Set KeyVault Name'
+              type: 'SetVariable'
+              dependsOn: []
+              userProperties: []
+              typeProperties: {
+                variableName: 'keyVaultName'
+                value: {
+                  value: '@concat(substring(pipeline().DataFactory, 0, 10) , substring(pipeline().DataFactory, lastIndexOf(pipeline().DataFactory, \'-\'), 14))'
+                  type: 'Expression'
+                }
+              }
+            }
+            {
+              name: 'Set Azure AD URI'
+              type: 'SetVariable'
+              dependsOn: []
+              userProperties: []
+              typeProperties: {
+                variableName: 'azureADUri'
+                value: 'login.microsoftonline.com'
+              }
+            }
+          ]
+        }
+      }
+    ]
+    parameters: {
+      Cloud: {
+        type: 'string'
+      }
+      ExportScope: {
+        type: 'string'
+      }
+      TenantId: {
+        type: 'string'
+      }
+    }
+    variables: {
+      resourceManagementUri: {
+        type: 'String'
+      }
+      keyVaultUriSuffix: {
+        type: 'String'
+      }
+      keyVaultName: {
+        type: 'String'
+      }
+      azureADUri: {
+        type: 'String'
+      }
+    }
+  }
+}
+
+//------------------------------------------------------------------------------
+// Export container extract pipeline
+// Triggered when an export is runs in Azure Cost Management.
+// Queues up the pipeline_transformExport pipeline.
+//------------------------------------------------------------------------------
 resource pipeline_extractExport 'Microsoft.DataFactory/factories/pipelines@2018-06-01' = {
   name: '${safeExportContainerName}_extract'
   parent: dataFactory
@@ -359,12 +630,10 @@ resource pipeline_extractExport 'Microsoft.DataFactory/factories/pipelines@2018-
 }
 
 //------------------------------------------------------------------------------
+//------------------------------------------------------------------------------
 // Export container transform pipeline
-// Trigger: pipeline_extractExport
-//
 // Converts CSV files to Parquet or .CSV.GZ files.
 //------------------------------------------------------------------------------
-
 resource pipeline_transformExport 'Microsoft.DataFactory/factories/pipelines@2018-06-01' = {
   name: '${safeExportContainerName}_transform'
   parent: dataFactory
