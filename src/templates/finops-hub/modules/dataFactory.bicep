@@ -17,6 +17,9 @@ param exportContainerName string
 @description('Required. The name of the container where normalized data is ingested.')
 param ingestionContainerName string
 
+@description('Optional. The name of the container where normalized data is ingested.')
+param configContainerName string = 'config'
+
 @description('Optional. Indicates whether ingested data should be converted to Parquet. Default: true.')
 param convertToParquet bool = true
 
@@ -51,11 +54,14 @@ var datasetPropsCommon = {
 
 var safeExportContainerName = replace('${exportContainerName}', '-', '_')
 var safeIngestionContainerName = replace('${ingestionContainerName}', '-', '_')
+var safeConfigContainerName = replace('${configContainerName}', '-', '_')
 
 // All hub triggers (used to auto-start)
 var extractExportTriggerName = exportContainerName
+var updateConfigTriggerName = configContainerName
 var allHubTriggers = [
   extractExportTriggerName
+  updateConfigTriggerName
 ]
 
 // Roles needed to auto-start triggers
@@ -175,6 +181,32 @@ resource linkedService_storageAccount 'Microsoft.DataFactory/factories/linkedser
 //------------------------------------------------------------------------------
 // Datasets
 //------------------------------------------------------------------------------
+
+resource dataset_config 'Microsoft.DataFactory/factories/datasets@2018-06-01' = {
+  name: safeConfigContainerName
+  parent: dataFactory
+  dependsOn: [
+    linkedService_keyVault
+  ]
+  properties: {
+    annotations: []
+    parameters: {
+      fileName: {
+        type: 'String'
+      }
+      folderName: {
+        type: 'String'
+      }
+    }
+    type: 'Json'
+    typeProperties: datasetPropsCommon
+    linkedServiceName: {
+      parameters: {}
+      referenceName: linkedService_storageAccount.name
+      type: 'LinkedServiceReference'
+    }
+  }
+}
 
 resource dataset_msexports 'Microsoft.DataFactory/factories/datasets@2018-06-01' = {
   name: safeExportContainerName
