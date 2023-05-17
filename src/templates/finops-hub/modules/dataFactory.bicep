@@ -548,18 +548,207 @@ resource pipeline_setup 'Microsoft.DataFactory/factories/pipelines@2018-06-01' =
                 value: 'login.microsoftonline.com'
               }
             }
+            {
+              name: 'Set Storage Account URI Suffix'
+              type: 'SetVariable'
+              dependsOn: []
+              userProperties: []
+              typeProperties: {
+                variableName: 'keyVaultName'
+                value: 'dfs.core.usgovcloudapi.net'
+              }
+            }
+            {
+              name: 'Set Storage Account Name'
+              type: 'SetVariable'
+              dependsOn: []
+              userProperties: []
+              typeProperties: {
+                variableName: 'keyVaultName'
+                value: {
+                  value: '@concat(substring(replace(pipeline().DataFactory, \'-\', \'\'), 0, 11) , substring(pipeline().DataFactory, add(lastIndexOf(pipeline().DataFactory, \'-\'),1), 13))'
+                  type: 'Expression'
+                }
+              }
+            }
           ]
+        }
+      }
+      {
+        name: 'Get Client ID'
+        type: 'WebActivity'
+        dependsOn: [
+          {
+            activity: 'Set Export Name'
+            dependencyConditions: [
+              'Succeeded'
+            ]
+          }
+        ]
+        policy: {
+          timeout: '0.12:00:00'
+          retry: 0
+          retryIntervalInSeconds: 30
+          secureOutput: false
+          secureInput: false
+        }
+        userProperties: []
+        typeProperties: {
+          url: {
+            value: '@concat(\'https://\', variables(\'keyVaultName\'), \'.\', variables(\'keyVaultUriSuffix\'), \'/secrets/ClientId\', pipeline().parameters.TenantId, \'?api-version=7.0\')'
+            type: 'Expression'
+          }
+          method: 'GET'
+          authentication: {
+            type: 'MSI'
+            resource: {
+              value: '@concat(\'https://\', variables(\'keyVaultUriSuffix\'))'
+              type: 'Expression'
+            }
+          }
+        }
+      }
+      {
+        name: 'Get Client Secret'
+        type: 'WebActivity'
+        dependsOn: [
+          {
+            activity: 'Get Client ID'
+            dependencyConditions: [
+              'Succeeded'
+            ]
+          }
+        ]
+        policy: {
+          timeout: '0.12:00:00'
+          retry: 0
+          retryIntervalInSeconds: 30
+          secureOutput: false
+          secureInput: false
+        }
+        userProperties: []
+        typeProperties: {
+          url: {
+            value: '@concat(\'https://\', variables(\'keyVaultName\'), \'.\', variables(\'keyVaultUriSuffix\'), \'/secrets/Secret\', pipeline().parameters.TenantId, \'?api-version=7.0\')'
+            type: 'Expression'
+          }
+          method: 'GET'
+          authentication: {
+            type: 'MSI'
+            resource: {
+              value: '@concat(\'https://\', variables(\'keyVaultUriSuffix\'))'
+              type: 'Expression'
+            }
+          }
+        }
+      }
+      {
+        name: 'Get Token'
+        type: 'WebActivity'
+        dependsOn: [
+          {
+            activity: 'Get Client Secret'
+            dependencyConditions: [
+              'Completed'
+            ]
+          }
+        ]
+        policy: {
+          timeout: '0.12:00:00'
+          retry: 0
+          retryIntervalInSeconds: 30
+          secureOutput: false
+          secureInput: false
+        }
+        userProperties: []
+        typeProperties: {
+          url: {
+            value: '@concat(\'https://\', variables(\'azureADUri\'), \'/\' ,pipeline().parameters.TenantId, \'/oauth2/v2.0/token\')'
+            type: 'Expression'
+          }
+          method: 'POST'
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded'
+          }
+          body: {
+            value: 'client_id=@{activity(\'Get Client ID\').output.value}&scope=https%3A%2F%2F@{variables(\'resourceManagementUri\')}%2F.default&client_secret=@{activity(\'Get Client Secret\').output.value}&grant_type=client_credentials'
+            type: 'Expression'
+          }
+        }
+      }
+      {
+        name: 'Create or Update Open Month Export'
+        type: 'WebActivity'
+        dependsOn: [
+          {
+            activity: 'Get Token'
+            dependencyConditions: [
+              'Succeeded'
+            ]
+          }
+        ]
+        policy: {
+          timeout: '0.12:00:00'
+          retry: 0
+          retryIntervalInSeconds: 30
+          secureOutput: false
+          secureInput: false
+        }
+        userProperties: []
+        typeProperties: {
+          url: {
+            value: 'https://@{variables(\'resourceManagementUri\')}@{pipeline().parameters.ExportScope}/providers/Microsoft.CostManagement/exports/@{variables(\'exportName\')}?api-version=2021-10-01'
+            type: 'Expression'
+          }
+          method: 'POST'
+          headers: {
+            Bearer: {
+              value: 'Bearer @{activity(\'Get Token\').output.access_token}'
+              type: 'Expression'
+            }
+          }
+          body: {
+            value: '{\n  "properties": {\n    "schedule": {\n      "status": "Active",\n      "recurrence": "Daily",\n      "recurrencePeriod": {\n        "from": "@{utcNow()}",\n        "to": "2099-12-31T00:00:00Z"\n      }\n    },\n    "partitionData": "True",\n    "format": "Csv",\n    "deliveryInfo": {\n      "destination": {\n        "resourceId": "@{pipeline().parameters.HubStorage}",\n        "container": "msexports",\n        "rootFolderPath": "@{pipeline().parameters.ExportScope}"\n      }\n    },\n    "definition": {\n      "type": "amortizedcost",\n      "timeframe": "BillingMonthToDate",\n      "dataSet": {\n        "granularity": "Daily"\n      }\n    }\n  }\n}'
+            type: 'Expression'
+          }
+        }
+      }
+      {
+        name: 'Set Export Name'
+        type: 'SetVariable'
+        dependsOn: [
+          {
+            activity: 'If Azure Commercial'
+            dependencyConditions: [
+              'Succeeded'
+            ]
+          }
+        ]
+        userProperties: []
+        typeProperties: {
+          variableName: 'exportName'
+          value: {
+            value: '@tolower(concat(replace(replace(pipeline().parameters.HubName, \'_\', \'\'), \'-\', \'\'),\'o\', last(split(pipeline().parameters.ExportScope, \'/\'))))'
+            type: 'Expression'
+          }
         }
       }
     ]
     parameters: {
       Cloud: {
         type: 'string'
+        defaultValue: 'azurecloud'
       }
       ExportScope: {
         type: 'string'
       }
       TenantId: {
+        type: 'string'
+      }
+      HubName: {
+        type: 'string'
+      }
+      HubStorage: {
         type: 'string'
       }
     }
@@ -574,6 +763,15 @@ resource pipeline_setup 'Microsoft.DataFactory/factories/pipelines@2018-06-01' =
         type: 'String'
       }
       azureADUri: {
+        type: 'String'
+      }
+      exportName: {
+        type: 'String'
+      }
+      storageAccountName: {
+        type: 'String'
+      }
+      storageAccountUriSuffix: {
         type: 'String'
       }
     }
